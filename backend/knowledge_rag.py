@@ -1523,6 +1523,251 @@ async def chat_stream(req: ChatRequest):
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
+@app.post("/documents/upload/stream", tags=["Documents"])
+async def upload_document_stream(file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"File too large (max {MAX_UPLOAD_MB} MB)")
+
+    async def event_stream():
+        def prog(stage, fraction, message=None, detail=None):
+            data = {"stage": stage, "fraction": round(fraction, 4)}
+            if message:
+                data["message"] = message
+            if detail:
+                data["detail"] = detail
+            return f"event: progress\ndata: {json.dumps(data)}\n\n"
+
+        def err(message):
+            return f"event: error\ndata: {json.dumps({'message': message})}\n\n"
+
+        try:
+            # ── upload ────────────────────────────────────────────────────────
+            yield prog("upload", 1.0, "File uploaded", file.filename)
+
+            # ── validation ───────────────────────────────────────────────────
+            yield prog("validation", 0.25, "Validating file", "Checking extension")
+            await asyncio.sleep(0)
+
+            ext = Path(file.filename).suffix.lower()
+            ALLOWED_EXTENSIONS = {
+                "pdf", "docx", "doc", "txt", "md", "rst",
+                "csv", "json", "xml", "html", "xlsx", "xls"
+            }
+            if ext not in ALLOWED_EXTENSIONS:
+                yield err(f"Unsupported file type: {ext}")
+                return
+
+            yield prog("validation", 0.6, "Validating file", "Validating MIME type")
+            await asyncio.sleep(0)
+
+            mime, _ = mimetypes.guess_type(file.filename)
+            yield prog("validation", 1.0, "Validating file", "File accepted")
+            await asyncio.sleep(0)
+
+            # ── setup ─────────────────────────────────────────────────────────
+            rag = await _get_rag()
+            doc_id      = str(uuid.uuid4())
+            stored_path = _save_uploaded_file(file.filename, content)
+            file_url    = f"/documents/{doc_id}/file"
+
+            # ── parsing ───────────────────────────────────────────────────────
+            yield prog("parsing", 0.1, "Parsing document", "Loading parser")
+            await asyncio.sleep(0)
+
+            elements = await asyncio.get_event_loop().run_in_executor(
+                None, extract_with_dockling, file.filename, content
+            )
+
+            yield prog("parsing", 0.6, "Parsing document", "Extracting text")
+            await asyncio.sleep(0)
+
+            text = "\n\n".join(el.get("text", "") for el in elements if el.get("text"))
+
+            yield prog("parsing", 1.0, "Parsing document", "Document parsed")
+            await asyncio.sleep(0)
+
+            # ── chunking ──────────────────────────────────────────────────────
+            yield prog("chunking", 0.0, "Chunking document", "Creating chunks")
+            await asyncio.sleep(0)
+
+            chunks_raw = chunk_elements(elements, target_size=1200, overlap=150)
+            total_chunks = len(chunks_raw)
+
+            yield prog("chunking", 0.5, "Chunking document", f"0/{total_chunks} chunks")
+            await asyncio.sleep(0)
+            yield prog("chunking", 1.0, "Chunking document", f"{total_chunks}/{total_chunks} chunks")
+            await asyncio.sleep(0)
+
+            # ── embedding ─────────────────────────────────────────────────────
+            chunk_texts  = [c["text"] for c in chunks_raw]
+            batch_size   = EMBED_BATCH_SIZE if EMBED_BATCH_SIZE > 0 else len(chunk_texts)
+            total_batches = math.ceil(len(chunk_texts) / batch_size) if batch_size else 1
+
+            all_embeddings: list[np.ndarray] = []
+            for batch_idx in range(total_batches):
+                start = batch_idx * batch_size
+                batch = chunk_texts[start: start + batch_size]
+
+                frac = batch_idx / total_batches
+                yield prog(
+                    "embedding",
+                    frac,
+                    "Embedding chunks",
+                    f"Batch {batch_idx + 1}/{total_batches}",
+                )
+
+                vecs = await _hf_embed(batch)
+                all_embeddings.append(vecs)
+
+            yield prog("embedding", 1.0, "Embedding chunks", f"Batch {total_batches}/{total_batches}")
+            await asyncio.sleep(0)
+
+            embeddings = np.vstack(all_embeddings) if len(all_embeddings) > 1 else all_embeddings[0]
+
+            # ── entities ──────────────────────────────────────────────────────
+            chunk_objs: list[dict] = []
+            doc_kg: dict = {"chunks": [], "relationships": [], "entities": []}
+            all_entities: dict[str, str] = {}
+
+            total_steps   = total_chunks
+            entity_count  = 0
+
+            for i, (raw, vec) in enumerate(zip(chunks_raw, embeddings)):
+                frac = i / max(total_steps, 1)
+                yield prog(
+                    "entities",
+                    frac,
+                    "Extracting entities",
+                    f"{entity_count} entities found",
+                )
+
+                cid = str(uuid.uuid4())
+                nodes, edges = extract_rule_entities(
+                    text=raw["text"],
+                    chunk_key=cid,
+                    file_path=file.filename,
+                    timestamp=int(time.time()),
+                    table_data=raw.get("data"),
+                )
+                nodes, edges = inject_hierarchy_edges(
+                    nodes=nodes,
+                    edges=edges,
+                    hierarchy_path=raw.get("hierarchy_path"),
+                    chunk_id=cid,
+                    file_path=file.filename,
+                )
+
+                doc_kg["chunks"].append({
+                    "content":   raw["text"],
+                    "source_id": cid,
+                    "file_path": file.filename,
+                })
+                doc_kg["entities"].extend(convert_nodes(nodes))
+                doc_kg["relationships"].extend(convert_edges(edges))
+
+                ents: list[dict] = []
+                for entity_name, entity_list in nodes.items():
+                    entity = entity_list[0]
+                    ents.append({"text": entity_name, "label": entity["entity_type"]})
+                    all_entities[entity_name] = entity["entity_type"]
+                    entity_count += 1
+
+                chunk_objs.append({
+                    "chunk_id":          cid,
+                    "doc_id":            doc_id,
+                    "doc_name":          file.filename,
+                    "text":              raw["text"],
+                    "display_text":      raw.get("display_text", raw["text"]),
+                    "index":             raw["index"],
+                    "breadcrumb":        raw.get("breadcrumb"),
+                    "hierarchy_path":    raw.get("hierarchy_path"),
+                    "table_part":        raw.get("table_part"),
+                    "table_parts_total": raw.get("table_parts_total"),
+                    "prev_chunk_id":     None,
+                    "next_chunk_id":     None,
+                    "page_hint":         raw.get("page"),
+                    "file_url":          file_url,
+                    "embedding":         vec.tolist(),
+                    "entities":          ents,
+                })
+
+                # yield every ~10 chunks to avoid flooding SSE
+                if i % max(1, total_steps // 20) == 0:
+                    await asyncio.sleep(0)
+
+            yield prog("entities", 1.0, "Extracting entities", f"{entity_count} entities found")
+            await asyncio.sleep(0)
+
+            # ── graph ─────────────────────────────────────────────────────────
+            yield prog("graph", 0.0, "Building graph", "Creating nodes")
+            await asyncio.sleep(0)
+
+            # fill prev/next
+            index_to_cid = {c["index"]: c["chunk_id"] for c in chunk_objs}
+            for obj in chunk_objs:
+                idx = obj["index"]
+                obj["prev_chunk_id"] = index_to_cid.get(idx - 1)
+                obj["next_chunk_id"] = index_to_cid.get(idx + 1)
+                CHUNKS[obj["chunk_id"]] = obj
+
+            yield prog("graph", 0.4, "Building graph", f"0/{len(doc_kg['relationships'])} edges")
+            await asyncio.sleep(0)
+
+            await rag.ainsert_custom_kg(doc_kg)
+
+            yield prog(
+                "graph", 1.0, "Building graph",
+                f"{len(doc_kg['relationships'])}/{len(doc_kg['relationships'])} edges",
+            )
+            await asyncio.sleep(0)
+
+            # ── indexing ──────────────────────────────────────────────────────
+            yield prog("indexing", 0.3, "Indexing", "Saving metadata")
+            await asyncio.sleep(0)
+
+            DOCS[doc_id] = {
+                "doc_id":          doc_id,
+                "filename":        file.filename,
+                "size_bytes":      len(content),
+                "char_count":      len(text),
+                "chunk_count":     len(chunk_objs),
+                "chunks":          [c["chunk_id"] for c in chunk_objs],
+                "entities":        all_entities,
+                "uploaded_at":     datetime.utcnow().isoformat(),
+                "text_preview":    text[:500],
+                "file_path":       str(stored_path),
+                "file_url":        file_url,
+                "stored_filename": stored_path.name,
+            }
+
+            try:
+                _persist_document(DOCS[doc_id], chunk_objs)
+            except Exception as e:
+                log.warning("Failed to persist %s: %s", doc_id, e)
+
+            yield prog("indexing", 1.0, "Indexing", "Finalizing")
+            await asyncio.sleep(0)
+
+            # ── done ──────────────────────────────────────────────────────────
+            yield prog("done", 1.0, "Complete")
+            done_payload = {
+                "doc_id":       doc_id,
+                "filename":     file.filename,
+                "chunk_count":  len(chunk_objs),
+                "top_entities": list(all_entities.items())[:20],
+            }
+            yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+
+        except Exception as exc:
+            log.exception("Streaming upload failed")
+            yield err(str(exc))
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 # ── Graph export ──────────────────────────────────────────────────────────────
 @app.get("/graph/export", tags=["Graph"])

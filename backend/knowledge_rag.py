@@ -148,7 +148,8 @@ EMBED_MAX_TOKENS  = _env_int("EMBED_MAX_TOKENS", 8192)
 #                     Keeps you under HF Inference API rate limits.
 EMBED_BATCH_SIZE  = _env_int(  "EMBED_BATCH_SIZE",   32)
 EMBED_BATCH_DELAY = _env_float("EMBED_BATCH_DELAY",   2.0)
-
+EMBED_MAX_RETRIES        = _env_int(  "EMBED_MAX_RETRIES",        5)
+EMBED_RETRY_BASE_DELAY   = _env_float("EMBED_RETRY_BASE_DELAY",   3.0)
 # HuggingFace Inference API base URL for Feature-Extraction (embedding) models.
 # Format: POST /models/<model_id>  with {"inputs": [...]}
 _HF_EMBED_URL = (
@@ -263,21 +264,19 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 async def _hf_embed(texts: List[str]) -> np.ndarray:
     """
-    Call the HuggingFace Feature-Extraction Inference API with optional batching.
+    Call the HuggingFace Feature-Extraction Inference API with batching,
+    retries, and exponential backoff.
 
-    When EMBED_BATCH_SIZE > 0 the input list is split into chunks of that size
-    and each chunk is sent as a separate HTTP request.  EMBED_BATCH_DELAY seconds
-    are awaited between consecutive calls so you stay within HF rate limits and
-    avoid paying for retries caused by 429 / 503 responses.
+    Retry policy (per batch):
+      • Retryable:  502 Bad Gateway, 503 Service Unavailable, 429 Rate Limited,
+                    aiohttp.ClientConnectorError, asyncio.TimeoutError
+      • Fatal:      401 Unauthorized, 400 Bad Request, any other 4xx
+      • Max attempts: EMBED_MAX_RETRIES  (default 5)
+      • Back-off:   EMBED_RETRY_BASE_DELAY * 2^attempt  + jitter  (capped at 60 s)
 
-    Endpoint:  POST https://router.huggingface.co/hf-inference/models/<model>
-    Auth:      Bearer HF_EMBED_API_KEY
-    Body:      {"inputs": ["text1", "text2", ...]}
-    Response:  list[list[float]]  — one vector per input string
-
-    Raises ValueError if the returned dimension doesn't match EMBED_DIM so
-    operators catch model/config mismatches immediately rather than getting
-    silent cosine-similarity crashes later.
+    Batching:
+      EMBED_BATCH_SIZE  — texts per API call   (0 = send all at once)
+      EMBED_BATCH_DELAY — sleep between batches (avoids rate limits)
     """
     global _embed_call_count
 
@@ -289,7 +288,6 @@ async def _hf_embed(texts: List[str]) -> np.ndarray:
     if not texts:
         return np.empty((0, EMBED_DIM), dtype=np.float32)
 
-    # ── Split into batches ────────────────────────────────────────────────────
     batch_size = EMBED_BATCH_SIZE if EMBED_BATCH_SIZE > 0 else len(texts)
     batches: List[List[str]] = [
         texts[i : i + batch_size] for i in range(0, len(texts), batch_size)
@@ -300,14 +298,15 @@ async def _hf_embed(texts: List[str]) -> np.ndarray:
         "Content-Type":  "application/json",
     }
 
+    # Retryable HTTP status codes
+    _RETRYABLE_STATUS = {429, 502, 503, 504}
+
     all_vecs: List[np.ndarray] = []
 
     async with aiohttp.ClientSession() as session:
         for batch_idx, batch in enumerate(batches):
-            _embed_call_count += 1
-            call_id = _embed_call_count
 
-            # Polite delay between batches (skip before the very first call)
+            # ── Inter-batch delay ─────────────────────────────────────────────
             if batch_idx > 0 and EMBED_BATCH_DELAY > 0:
                 log.debug(
                     "[EMBED] sleeping %.1fs before batch %d/%d",
@@ -317,77 +316,127 @@ async def _hf_embed(texts: List[str]) -> np.ndarray:
 
             payload = {
                 "inputs":  batch,
-                # wait_for_model=True avoids 503 "model loading" errors on cold
-                # starts — the request blocks server-side until the model is warm.
                 "options": {"wait_for_model": True},
             }
 
-            t0 = time.perf_counter()
+            # ── Per-batch retry loop ──────────────────────────────────────────
+            last_exc: Exception | None = None
 
-            async with session.post(
-                _HF_EMBED_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status == 401:
-                    raise RuntimeError(
-                        "HuggingFace embedding API returned 401 Unauthorized. "
-                        "Check HF_EMBED_API_KEY in .env."
-                    )
-                if resp.status == 429:
-                    body = await resp.text()
-                    raise RuntimeError(
-                        f"HuggingFace embedding API rate-limited (429). "
-                        f"Increase EMBED_BATCH_DELAY in .env. Body: {body[:200]}"
-                    )
-                if resp.status == 503:
-                    body = await resp.text()
-                    raise RuntimeError(
-                        f"HuggingFace embedding model is loading (503). "
-                        f"Retry in a few seconds. Body: {body[:200]}"
-                    )
-                resp.raise_for_status()
-                data = await resp.json(content_type=None)
+            for attempt in range(EMBED_MAX_RETRIES):
+                _embed_call_count += 1
+                call_id = _embed_call_count
 
-            elapsed = time.perf_counter() - t0
+                # Exponential backoff with ±20 % jitter (skip on first attempt)
+                if attempt > 0:
+                    base_delay  = EMBED_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    jitter      = base_delay * 0.2 * (2 * __import__("random").random() - 1)
+                    sleep_for   = min(base_delay + jitter, 60.0)
+                    log.warning(
+                        "[EMBED #%d] batch %d/%d attempt %d/%d — retrying in %.1fs "
+                        "after: %s",
+                        call_id, batch_idx + 1, len(batches),
+                        attempt + 1, EMBED_MAX_RETRIES,
+                        sleep_for, last_exc,
+                    )
+                    await asyncio.sleep(sleep_for)
 
-            if not data:
-                raise ValueError(
-                    f"HuggingFace embedding API returned an empty response "
-                    f"for batch {batch_idx + 1}/{len(batches)}."
+                t0 = time.perf_counter()
+
+                try:
+                    async with session.post(
+                        _HF_EMBED_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        status = resp.status
+
+                        # ── Fatal errors — do not retry ───────────────────────
+                        if status == 401:
+                            raise RuntimeError(
+                                "HuggingFace embedding API returned 401 Unauthorized. "
+                                "Check HF_EMBED_API_KEY in .env."
+                            )
+                        if status == 400:
+                            body = await resp.text()
+                            raise RuntimeError(
+                                f"HuggingFace embedding API bad request (400): {body[:300]}"
+                            )
+
+                        # ── Retryable errors ──────────────────────────────────
+                        if status in _RETRYABLE_STATUS:
+                            body = await resp.text()
+                            last_exc = RuntimeError(
+                                f"HF embed API transient error {status} "
+                                f"(batch {batch_idx+1}/{len(batches)}, "
+                                f"attempt {attempt+1}/{EMBED_MAX_RETRIES}): "
+                                f"{body[:200]}"
+                            )
+                            continue   # → next attempt
+
+                        # ── Any other non-200 ─────────────────────────────────
+                        if status not in (200, 201):
+                            body = await resp.text()
+                            raise RuntimeError(
+                                f"HuggingFace embedding API error {status}: {body[:300]}"
+                            )
+
+                        data = await resp.json(content_type=None)
+
+                except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+                    last_exc = exc
+                    log.warning(
+                        "[EMBED #%d] batch %d/%d attempt %d/%d — network error: %s",
+                        call_id, batch_idx + 1, len(batches),
+                        attempt + 1, EMBED_MAX_RETRIES, exc,
+                    )
+                    continue   # → next attempt
+
+                # ── Success — parse response ──────────────────────────────────
+                elapsed = time.perf_counter() - t0
+
+                if not data:
+                    raise ValueError(
+                        f"HuggingFace embedding API returned an empty response "
+                        f"for batch {batch_idx + 1}/{len(batches)}."
+                    )
+
+                # HF may return token-level vectors; mean-pool to sentence level
+                if isinstance(data[0][0], list):
+                    batch_arr = np.array(
+                        [np.mean(token_vecs, axis=0) for token_vecs in data],
+                        dtype=np.float32,
+                    )
+                else:
+                    batch_arr = np.array(data, dtype=np.float32)
+
+                if batch_arr.ndim == 1:
+                    batch_arr = batch_arr.reshape(1, -1)
+
+                if batch_arr.shape[1] != EMBED_DIM:
+                    raise ValueError(
+                        f"HF model '{HF_EMBED_MODEL}' returned dim={batch_arr.shape[1]} "
+                        f"but EMBED_DIM={EMBED_DIM}. "
+                        f"Set EMBED_DIM={batch_arr.shape[1]} in .env and restart."
+                    )
+
+                log.debug(
+                    "[EMBED #%d] model=%s batch=%d/%d texts=%d shape=%s %.2fs",
+                    call_id, HF_EMBED_MODEL,
+                    batch_idx + 1, len(batches),
+                    len(batch), batch_arr.shape, elapsed,
                 )
 
-            # HF Feature-Extraction returns one of:
-            #   list[list[float]]          — standard (one vector per input)
-            #   list[list[list[float]]]    — token-level; take mean across tokens
-            if isinstance(data[0][0], list):
-                # shape: (batch, seq_len, dim) → mean over seq_len → (batch, dim)
-                batch_arr = np.array(
-                    [np.mean(token_vecs, axis=0) for token_vecs in data],
-                    dtype=np.float32,
-                )
-            else:
-                batch_arr = np.array(data, dtype=np.float32)
+                all_vecs.append(batch_arr)
+                last_exc = None
+                break   # ← success; exit retry loop
 
-            if batch_arr.ndim == 1:
-                batch_arr = batch_arr.reshape(1, -1)
-
-            if batch_arr.shape[1] != EMBED_DIM:
-                raise ValueError(
-                    f"HF model '{HF_EMBED_MODEL}' returned dim={batch_arr.shape[1]} "
-                    f"but EMBED_DIM={EMBED_DIM}. "
-                    f"Set EMBED_DIM={batch_arr.shape[1]} in .env and restart."
-                )
-
-            log.debug(
-                "[EMBED #%d] model=%s batch=%d/%d texts=%d shape=%s %.2fs",
-                call_id, HF_EMBED_MODEL,
-                batch_idx + 1, len(batches), len(batch),
-                batch_arr.shape, elapsed,
-            )
-
-            all_vecs.append(batch_arr)
+            # ── All attempts exhausted ────────────────────────────────────────
+            if last_exc is not None:
+                raise RuntimeError(
+                    f"HuggingFace embedding API failed after {EMBED_MAX_RETRIES} "
+                    f"attempts on batch {batch_idx + 1}/{len(batches)}: {last_exc}"
+                ) from last_exc
 
     return np.vstack(all_vecs) if len(all_vecs) > 1 else all_vecs[0]
 

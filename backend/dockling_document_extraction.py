@@ -1,34 +1,17 @@
 """
 Hierarchical, context-aware document extraction and chunking.
 
-Improvements in this revision
-──────────────────────────────
-  • Single DocumentConverter instance (module-level singleton) so model
-    weights are loaded exactly once across all files in a session.
+Changes from previous revision
+────────────────────────────────
+  • DocumentConverter is now loaded through lazy_converter.py:
+      - docling is NOT imported at module load time
+      - first call to _get_converter() (or an explicit preload_converter())
+        triggers the actual import + instantiation
+      - preload_converter() runs that work in a background daemon thread so
+        app startup is not blocked by model-weight loading
 
-  • PDF title promotion: the very first heading seen in a PDF (which
-    Docling usually calls SECTION_HEADER with .level == 1) is promoted
-    to level 0 (document root) when no TITLE element has been seen yet,
-    matching DOCX behaviour where "TITLE" comes through explicitly.
-
-  • Heading-level guard: _resolve_heading_level now uses docling's
-    reported .level properly for SECTION_HEADER (1-based → 0-based
-    internally, so level-1 section headers sit at depth 1, not depth 2).
-
-  • Section flush no longer unconditionally drops current_parts[0].
-    It only strips the leading heading line when the chunk was opened by
-    a Heading element (tracked via `_current_parts_has_heading` flag).
-
-  • Table NER prose: each table chunk gets a one-line natural-language
-    summary prepended to `text` so spaCy / graph extractors see entities
-    without having to parse the key=value schema format.
-
-  • Empty display_text guard: _with_markdown_breadcrumb returns only
-    the trail when body is empty, which is valid but now explicitly
-    handled so the viewer always gets something sensible.
-
-  • _resolve_heading_level: treats docling's 1-based .level as
-    0-based internally (level 1 → depth 1, not depth 2).
+  All other logic (heading promotion, table NER prose, chunking, linkage)
+  is unchanged.
 """
 
 import re
@@ -38,21 +21,13 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 import fitz
-from docling.document_converter import DocumentConverter
 
-
-# ---------------------------------------------------------
-# MODULE-LEVEL SINGLETON  (avoids reloading model weights)
-# ---------------------------------------------------------
-
-_CONVERTER: DocumentConverter | None = None
-
-
-def _get_converter() -> DocumentConverter:
-    global _CONVERTER
-    if _CONVERTER is None:
-        _CONVERTER = DocumentConverter()
-    return _CONVERTER
+# ── Lazy-loaded DocumentConverter (replaces the old inline singleton) ─────────
+from backend.lazy_converter import _get_converter, preload_converter  # noqa: F401
+# Callers can now do:
+#   from chunker import preload_converter; preload_converter()
+# at app startup to begin warming the model in the background.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ---------------------------------------------------------
@@ -81,12 +56,6 @@ def html_table_to_records(html: str):
 # ---------------------------------------------------------
 
 def table_to_text(df, header_columns=None):
-    """
-    Compact LLM/embedding-facing representation.
-    Prefixed with a one-line prose summary for NER / graph extraction:
-      'Table with columns: Col1, Col2, Col3 (N rows)'
-    so entity extractors see the column names as natural text.
-    """
     columns = header_columns if header_columns is not None else list(df.columns)
     n_rows = len(df)
 
@@ -107,12 +76,10 @@ def _escape_md_cell(val) -> str:
 
 
 def table_to_markdown(df, header_columns=None) -> str:
-    """Human-facing markdown table for display_text."""
     columns = header_columns if header_columns is not None else list(df.columns)
     if not columns:
         return ""
 
-    # compute column widths for alignment
     col_widths = [max(3, len(str(c))) for c in columns]
     for _, row in df.iterrows():
         for j, col in enumerate(columns):
@@ -132,10 +99,6 @@ def table_to_markdown(df, header_columns=None) -> str:
 
 
 def markdown_breadcrumb(path) -> str:
-    """
-    Render hierarchy path as markdown headings.
-    level 0 → h1, level 1 → h2, etc. (clamped to h1–h6).
-    """
     if not path:
         return ""
     lines = []
@@ -152,42 +115,26 @@ def markdown_breadcrumb(path) -> str:
 
 _HEADING_LEVEL_BY_LABEL = {
     "TITLE":          0,
-    "SECTION_HEADER": 1,   # will be overridden by .level when available
+    "SECTION_HEADER": 1,
     "HEADING":        1,
 }
 
 
 def _resolve_heading_level(item, label: str) -> int:
-    """
-    Map a Docling item to an internal 0-based heading depth.
-
-    Docling SECTION_HEADER .level is 1-based (1 = top-level section).
-    We convert: internal_depth = docling_level   (so level-1 → depth 1,
-    which nests correctly under a TITLE at depth 0).
-
-    TITLE is always depth 0 (document root).
-    HEADING without .level → depth 1 (same as top-level section).
-    """
     if label == "TITLE":
         return 0
 
     level = getattr(item, "level", None)
     if isinstance(level, int) and level >= 1:
-        return level          # 1-based == 0-based depth for non-TITLE
+        return level
 
     return _HEADING_LEVEL_BY_LABEL.get(label, 1)
 
 
 class HeadingStack:
-    """
-    Maintains the current ancestor chain.
-    Pushing level N pops everything at depth >= N first (siblings replace,
-    children nest).
-    """
-
     def __init__(self):
-        self._stack = []   # list of (depth, text, node_id)
-        self._has_title = False   # tracks whether a depth-0 heading was seen
+        self._stack = []
+        self._has_title = False
 
     def push(self, depth: int, text: str) -> str:
         while self._stack and self._stack[-1][0] >= depth:
@@ -199,15 +146,7 @@ class HeadingStack:
         return node_id
 
     def promote_first_to_title(self):
-        """
-        Call this when the document is a PDF and no TITLE element has been
-        emitted yet but we are about to push the very first heading.
-        Resets _has_title so the next push() at any depth is treated as
-        the document root (depth 0).
-
-        Callers should only invoke this once per document.
-        """
-        self._has_title = True   # mark as handled; push will do the rest
+        self._has_title = True
 
     @property
     def needs_title_promotion(self) -> bool:
@@ -235,23 +174,16 @@ class HeadingStack:
 # ---------------------------------------------------------
 
 def _process_doc(doc, output: list, heading_stack: HeadingStack, is_pdf: bool):
-    """
-    Walk one Docling Document and append structured elements to `output`.
-    Mutates `heading_stack` in place (carries state across PDF page batches).
-    """
     for item, _depth in doc.iterate_items():
         label = item.label.name
         text = (getattr(item, "text", "") or "").strip()
 
-        # ── HEADINGS ──────────────────────────────────────────────────────
         if label in {"TITLE", "SECTION_HEADER", "HEADING"}:
             if not text:
                 continue
 
             h_depth = _resolve_heading_level(item, label)
 
-            # PDF title promotion: first heading ever seen in a PDF document
-            # that is NOT already labelled TITLE gets promoted to depth 0.
             if is_pdf and label != "TITLE" and heading_stack.needs_title_promotion:
                 h_depth = 0
 
@@ -267,7 +199,6 @@ def _process_doc(doc, output: list, heading_stack: HeadingStack, is_pdf: bool):
             })
             continue
 
-        # ── TABLES ────────────────────────────────────────────────────────
         if label == "TABLE":
             table_data, columns, table_text = [], [], ""
             try:
@@ -293,7 +224,6 @@ def _process_doc(doc, output: list, heading_stack: HeadingStack, is_pdf: bool):
             })
             continue
 
-        # ── NORMAL TEXT ───────────────────────────────────────────────────
         if text:
             output.append({
                 "type":       label,
@@ -308,8 +238,8 @@ def _process_doc(doc, output: list, heading_stack: HeadingStack, is_pdf: bool):
 
 
 def extract_with_dockling(filename: str, content: bytes, batch_size: int = 2):
-    suffix   = Path(filename).suffix.lower()
-    converter = _get_converter()          # reuse singleton
+    suffix    = Path(filename).suffix.lower()
+    converter = _get_converter()          # lazy — loads on first call
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(content)
@@ -382,14 +312,12 @@ def _split_long_text(text: str, target_size: int, overlap: int):
 # ---------------------------------------------------------
 
 def _with_breadcrumb(breadcrumb: str | None, text: str) -> str:
-    """LLM/embedding-facing: compact [Context: ...] tag."""
     if breadcrumb:
         return f"[Context: {breadcrumb}]\n\n{text}"
     return text
 
 
 def _with_markdown_breadcrumb(path, body_markdown: str) -> str:
-    """Human-facing: real markdown heading trail."""
     trail = markdown_breadcrumb(path)
     if trail and body_markdown.strip():
         return f"{trail}\n\n{body_markdown}"
@@ -403,20 +331,10 @@ def _with_markdown_breadcrumb(path, body_markdown: str) -> str:
 # ---------------------------------------------------------
 
 def _table_ner_summary(columns: list, data: list) -> str:
-    """
-    One-line prose summary prepended to table `text` so spaCy NER and
-    graph extractors see entity-bearing tokens in natural language, not
-    just schema format.
-
-    Example:
-      'Table with columns: Project, Hull No, Equipment (6 rows).
-       Sample values — Project: 50,000 DWT Bulk Carrier; Hull No: HN-2026-045.'
-    """
     n = len(data)
     col_str = ", ".join(columns)
     summary = f"Table with columns: {col_str} ({n} row{'s' if n != 1 else ''})."
 
-    # add a sample of real values from row 0 so NER sees actual entities
     if data:
         row0 = data[0]
         samples = "; ".join(
@@ -471,13 +389,12 @@ def _split_large_table(el: dict, target_size: int) -> list:
             "table_parts_total": 1,
         }]
 
-    # row-batch split
     header_overhead  = len("TABLE SCHEMA:\n" + ", ".join(columns) + "\n\nTABLE DATA:\n")
     avg_row_len      = max(1, (len(full_text) - header_overhead) // max(1, len(data)))
     rows_per_chunk   = max(1, (target_size - header_overhead) // avg_row_len)
     row_batches      = [data[i:i + rows_per_chunk] for i in range(0, len(data), rows_per_chunk)]
     total_parts      = len(row_batches)
-    ner_summary      = _table_ner_summary(columns, data)   # same summary on every part
+    ner_summary      = _table_ner_summary(columns, data)
 
     chunks = []
     for i, batch in enumerate(row_batches):
@@ -505,27 +422,15 @@ def _split_large_table(el: dict, target_size: int) -> list:
 # ---------------------------------------------------------
 
 def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) -> list:
-    """
-    Build chunks while respecting document hierarchy.
-
-    Each chunk carries:
-      text          – LLM/embedding/BM25 facing. [Context: breadcrumb] prefix,
-                      tables as prose summary + key=value rows.
-      display_text  – human-facing. Markdown heading trail, aligned markdown tables.
-      data          – structured row records (table chunks only).
-      breadcrumb    – " > " joined heading path string.
-      hierarchy_path – list of {level, text, node_id} dicts.
-      chunk_id, prev_chunk_id, next_chunk_id, section_id, index, level.
-    """
     raw_chunks = []
 
-    current_parts             = []
-    current_size              = 0
-    current_breadcrumb        = None
-    current_path              = None
-    current_section_id        = None
-    current_level             = None
-    _current_opened_by_heading = False    # True when current_parts[0] is a Heading text
+    current_parts              = []
+    current_size               = 0
+    current_breadcrumb         = None
+    current_path               = None
+    current_section_id         = None
+    current_level              = None
+    _current_opened_by_heading = False
 
     def flush():
         nonlocal current_parts, current_size, _current_opened_by_heading
@@ -534,14 +439,10 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
 
         body = "\n\n".join(current_parts)
 
-        # For display_text: if this chunk was opened by a Heading element,
-        # current_parts[0] is that heading's text — the markdown breadcrumb
-        # already contains it as the final heading level, so skip it to avoid
-        # duplication. Otherwise keep all parts.
         if _current_opened_by_heading and len(current_parts) > 1:
             display_body = "\n\n".join(current_parts[1:]).strip()
         elif _current_opened_by_heading:
-            display_body = ""   # heading with no body content yet — trail is enough
+            display_body = ""
         else:
             display_body = body
 
@@ -565,7 +466,6 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
         if not text:
             continue
 
-        # ── HEADING: flush current section, start new ────────────────────
         if el_type == "Heading":
             flush()
             current_breadcrumb         = el.get("breadcrumb")
@@ -577,15 +477,11 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
             _current_opened_by_heading = True
             continue
 
-        # ── TABLE: flush then emit own chunk(s) ──────────────────────────
         if el_type == "Table":
             flush()
             raw_chunks.extend(_split_large_table(el, target_size))
             continue
 
-        # ── SECTION BOUNDARY GUARD ────────────────────────────────────────
-        # Defensive: if content arrives tagged to a different section than
-        # what we're accumulating, flush first.
         if (
             current_parts
             and el.get("section_id") is not None
@@ -599,14 +495,13 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
             current_level              = el.get("level")
             _current_opened_by_heading = False
 
-        # ── LARGE PARAGRAPH: sentence-aware split ────────────────────────
         if len(text) > target_size * 1.5:
             flush()
             pieces = _split_long_text(text, target_size, overlap)
             total  = len(pieces)
             for i, piece in enumerate(pieces):
-                marker   = f"(continued {i + 1}/{total})" if total > 1 else ""
-                body     = f"{marker}\n{piece}".strip() if marker else piece
+                marker    = f"(continued {i + 1}/{total})" if total > 1 else ""
+                body      = f"{marker}\n{piece}".strip() if marker else piece
                 md_marker = f"*(continued {i + 1}/{total})*\n\n" if total > 1 else ""
                 raw_chunks.append({
                     "type":         "paragraph",
@@ -619,7 +514,6 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
                 })
             continue
 
-        # ── NORMAL ACCUMULATION ───────────────────────────────────────────
         if current_size + len(text) > target_size:
             flush()
             current_breadcrumb         = el.get("breadcrumb")
@@ -635,7 +529,6 @@ def chunk_elements(elements: list, target_size: int = 1200, overlap: int = 150) 
 
     flush()
 
-    # ── LINKAGE PASS ─────────────────────────────────────────────────────
     for c in raw_chunks:
         c["chunk_id"] = str(uuid.uuid4())
 

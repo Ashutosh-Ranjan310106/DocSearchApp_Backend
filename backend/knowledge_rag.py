@@ -635,26 +635,70 @@ async def stream_llm(system: str, messages: List[Dict]) -> asyncio.Queue:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _rag: LightRAG | None = None
-
+_rag_lock = asyncio.Lock() 
+_rag_init_state: str = "pending" 
+_rag_init_error: Exception | None = None
 
 async def _init_rag() -> LightRAG:
-    global _rag
+    """
+    Lazy, concurrency-safe LightRAG initialiser.
+
+    • First caller acquires the lock and does the real init.
+    • Any concurrent callers that reach the lock while init is in progress
+      wait, then return the already-initialised instance (double-checked locking).
+    • Subsequent callers skip the lock entirely (fast path: _rag is not None).
+    • If init fails, _rag_init_state is set to "failed" so callers get a clear
+      error instead of a silent None.
+    """
+    global _rag, _rag_init_state, _rag_init_error
+
+    # ── Fast path — already initialised ──────────────────────────────────────
     if _rag is not None:
         return _rag
-    _rag = LightRAG(
-        working_dir="./rag_storage",
-        llm_model_func=lightrag_hf,          # HF LLM, HF_LLM_API_KEY
-        embedding_func=_make_embedding_func(),  # HF embed, HF_EMBED_API_KEY
-    )
-    await _rag.initialize_storages()
-    await initialize_pipeline_status()
-    return _rag
+
+    # ── Slow path — acquire lock, double-check, then init ────────────────────
+    async with _rag_lock:
+        # Another coroutine may have finished init while we were waiting.
+        if _rag is not None:
+            return _rag
+
+        if _rag_init_state == "failed":
+            raise RuntimeError(
+                f"LightRAG initialisation previously failed: {_rag_init_error}"
+            ) from _rag_init_error
+
+        _rag_init_state = "initialising"
+        log.info("LightRAG: starting lazy initialisation …")
+        t0 = time.perf_counter()
+        try:
+            instance = LightRAG(
+                working_dir="./rag_storage",
+                llm_model_func=lightrag_hf,
+                embedding_func=_make_embedding_func(),
+            )
+            await instance.initialize_storages()
+            await initialize_pipeline_status()
+
+            _rag = instance
+            _rag_init_state = "ready"
+            log.info(
+                "LightRAG: initialisation complete (%.2fs)", time.perf_counter() - t0
+            )
+            return _rag
+
+        except Exception as exc:
+            _rag_init_state = "failed"
+            _rag_init_error = exc
+            log.exception("LightRAG: initialisation failed")
+            raise
 
 
 async def _get_rag() -> LightRAG:
-    if _rag is None:
-        raise RuntimeError("LightRAG not yet initialised — startup did not complete")
-    return _rag
+    """
+    Public entry-point for all routes that need LightRAG.
+    Triggers lazy init on first call; returns immediately on subsequent calls.
+    """
+    return await _init_rag()
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -662,7 +706,6 @@ async def _get_rag() -> LightRAG:
 async def lifespan(app: FastAPI):
     _init_db()
     _load_all_from_db()
-    await _init_rag()
     yield
     if _rag is not None:
         await _rag.finalize_storages()

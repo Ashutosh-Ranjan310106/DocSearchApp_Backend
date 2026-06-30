@@ -75,7 +75,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from backend.dockling_document_extraction import chunk_elements, extract_with_dockling
+from backend.dockling_client import (
+        check_dockling_health,
+        chunk_elements,
+        extract_with_dockling,
+    )
 from backend.entity_extractor import extract_rule_entities
 from lightrag import LightRAG, QueryParam
 from lightrag.kg.shared_storage import initialize_pipeline_status
@@ -190,7 +194,7 @@ CORS_ORIGINS  = [
 
 log               = logging.getLogger("docsearch")
 _embed_call_count = 0
-
+DOCKLING_SERVICE_URL = os.getenv("DOCKLING_SERVICE_URL", "")
 
 # ── Startup validation ────────────────────────────────────────────────────────
 # Warn loudly at import time if the API keys are missing so operators
@@ -1618,9 +1622,7 @@ async def upload_document_stream(file: UploadFile = File(...)):
             yield prog("parsing", 0.1, "Parsing document", "Loading parser")
             await asyncio.sleep(0)
 
-            elements = await asyncio.get_event_loop().run_in_executor(
-                None, extract_with_dockling, file.filename, content
-            )
+            elements = await extract_with_dockling(file.filename, content)
 
             yield prog("parsing", 0.6, "Parsing document", "Extracting text")
             await asyncio.sleep(0)
@@ -1996,6 +1998,7 @@ def root():
         "version": "2.0.0",
         "docs":    "/docs",
         "status":  "ok",
+        "dockling_service": DOCKLING_SERVICE_URL or "not configure"
         # embedding config
         "embed_model":  HF_EMBED_MODEL,
         "embed_dim":    EMBED_DIM,
@@ -2021,7 +2024,7 @@ def root():
 
 
 @app.get("/health", tags=["Health"])
-def health():
+async def health():
     return {
         "status":    "ok",
         "version":   "2.0.0",
@@ -2031,11 +2034,14 @@ def health():
         "embed_key_set": bool(HF_EMBED_API_KEY),
         "llm_model":     HF_LLM_MODEL,
         "llm_key_set":   bool(HF_LLM_API_KEY),
+        "dockling_service": DOCKLING_SERVICE_URL or "not configured",
+        "dockling": await check_dockling_health(),
         "db_path":       str(DB_PATH),
         "rag_storage":   str(Path("./rag_storage").resolve()),
         "upload_dir":    str(UPLOAD_DIR),
         "documents":     len(DOCS),
         "chunks":        len(CHUNKS),
+        "rag_state":     _rag_init_state,
         "features": {
             "reranker":    SENTENCE_TRANSFORMERS_OK,
             "spacy_ner":   SPACY_OK,
